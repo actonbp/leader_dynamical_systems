@@ -24,6 +24,3 @@ This folder contains the shareable code and documentation that accompany Chapter
 2. If you have your own data, save it as `data/identity_timeseries.csv` matching `resources/data_requirements.md`.
 3. Run `scripts/dynamic_states_walkthrough.R` or render `scripts/dynamic_states_walkthrough.qmd` for the core analysis.
 4. Render `scripts/dynamic_states_sim_demo.qmd` for the simulated illustration and plots.
-
-## License
-This toolkit inherits the root repository's license. Update this README if you distribute it separately.
