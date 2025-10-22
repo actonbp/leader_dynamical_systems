@@ -1,0 +1,217 @@
+---
+title: "Dynamic States Walkthrough (Step 1–3)"
+format:
+  html:
+    toc: true
+    toc-depth: 2
+    code-fold: true
+    number-sections: true
+  pdf: default
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+# Overview
+
+This document implements the three-step dynamical systems walkthrough described in the chapter and provides explanatory text alongside executable R code. The goals are:
+
+- Capture short-term leadership identity dynamics via within-person residuals and local derivatives.
+- Operationalize two descriptive features:
+  - Frequency of fluctuation: magnitude of the first derivative (velocity).
+  - Speed of return: second derivative (acceleration).
+- Show how to estimate these features using the GOLD method (Deboeck & Boker, 2010) and test basic multilevel relations with events and follower identity.
+
+Note on operationalization: We operationalize frequency of fluctuation and speed of return using derivatives as descriptive, within-person features. Formal damping ratio (zeta) and natural frequency (omega) would require fitting a second-order ODE (e.g., x'' = -2·zeta·omega·x' - omega^2·x). The present approach is aligned with our Step 1–3 guidance and supports practical, transparent analyses.
+
+Method selection guide (when to use what):
+- Use derivative proxies (this document) for short, sparse series and micro-dynamics questions; aggregate per ID×context and model hierarchically for population inference.
+- Use ODE/ctsem/state-space for interpretable system parameters (ω, ζ), longer/denser series, explicit input/error modeling, and cross-study comparability.
+- Always report time units, embedding (tau), interpolation choice, and sensitivity outcomes.
+
+# Setup
+
+```{r}
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(here)
+  library(nlme)
+  library(imputeTS)
+  library(doremi)
+  library(lmerTest)
+})
+
+# Parameters
+embedding_dim <- 4         # GOLD window length (tau); 3–5 reasonable
+impute_option <- "linear"   # 'linear' or 'spline'
+start_time_at_zero <- TRUE  # keep per-week days at 0..6
+# Data mode: "simulate" or "csv"
+data_mode <- "simulate"
+csv_path  <- here("data", "identity_timeseries.csv")
+```
+
+# Data
+
+Use either your own CSV with columns `ID, week, sday, GrL, GrF` and either `e2,e3,e6` or `event_agg`, or set `data_mode <- "simulate"` to generate example data.
+
+```{r}
+if (identical(data_mode, "csv") && file.exists(csv_path)) {
+  raw <- readr::read_csv(csv_path, show_col_types = FALSE)
+} else {
+  source(here("scripts", "simulate_dynamic_identity.R"))
+  raw <- simulate_identity_data(n_id = 20, seed = 42)
+}
+
+if (!all(c("ID","week","sday","GrL","GrF") %in% names(raw))) stop("Missing required columns.")
+if (!("event_agg" %in% names(raw))) {
+  if (all(c("e2","e3","e6") %in% names(raw))) raw <- raw %>% mutate(event_agg = (e2 + e3 + e6)/3) else stop("Provide e2,e3,e6 or event_agg.")
+}
+dat <- raw %>% select(ID, week, sday, GrL, GrF, event_agg) %>% arrange(ID, week, sday)
+```
+
+# Step 1: Missing Data Handling (Interpolation)
+
+Interpolates within-person, within-week. Interpolation assumes MAR and may smooth or introduce artifacts; we recommend reporting robustness across `linear` and `spline` interpolation.
+
+```{r}
+dat_i <- dat %>%
+  group_by(ID, week) %>%
+  group_modify(~ na_interpolation(.x, option = impute_option)) %>%
+  ungroup() %>%
+  mutate(TIME = sday - 1)
+```
+
+# Step 2: Linear De-trending (Level-1 Residuals)
+
+Residuals represent within-person deviations from a contextual equilibrium (linear trend). For sensitivity, a local-level/state-space approach could be substituted.
+
+```{r}
+detres <- function(df, y) {
+  f <- as.formula(paste0(y, " ~ TIME"))
+  m <- lme(f, random = ~ TIME | ID, data = df, control = list(opt = "optim"),
+           na.action = na.omit)
+  residuals(m, type = "response")
+}
+
+ctx_a <- dat_i %>% filter(week == 1)
+ctx_b <- dat_i %>% filter(week == 2)
+ctx_c <- dat_i %>% filter(week == 3)
+
+res_a_l <- detres(ctx_a, "GrL"); res_b_l <- detres(ctx_b, "GrL"); res_c_l <- detres(ctx_c, "GrL")
+res_a_f <- detres(ctx_a, "GrF"); res_b_f <- detres(ctx_b, "GrF"); res_c_f <- detres(ctx_c, "GrF")
+res_a_e <- detres(ctx_a, "event_agg"); res_b_e <- detres(ctx_b, "event_agg"); res_c_e <- detres(ctx_c, "event_agg")
+
+dat_i2 <- bind_rows(ctx_a, ctx_b, ctx_c) %>%
+  arrange(ID, week, TIME) %>%
+  mutate(l_res = c(res_a_l, res_b_l, res_c_l),
+         f_res = c(res_a_f, res_b_f, res_c_f),
+         e_res = c(res_a_e, res_b_e, res_c_e))
+```
+
+# Step 3: GOLD Derivatives (Velocity and Acceleration)
+
+We compute first (velocity) and second (acceleration) derivatives per `ID × week` window using GOLD (Deboeck & Boker, 2010). Units are per day. These derivatives serve as descriptive operationalizations of fluctuation and return speed.
+
+```{r}
+gold_velocity <- function(x, t, emb = embedding_dim) {
+  if (length(t) < emb) return(NA_real_)
+  g <- calculate.gold(x, t, embedding = emb)
+  as.numeric(g$dsignal[seq_len(emb), 2])
+}
+
+gold_accel <- function(x, t, emb = embedding_dim) {
+  if (length(t) < emb) return(NA_real_)
+  g <- calculate.gold(x, t, embedding = emb)
+  as.numeric(g$dsignal[seq_len(emb), 3])
+}
+
+rep_id <- function(id, t, emb = embedding_dim) if (length(t) < emb) NA else rep(unique(id), each = emb)
+rep_week <- function(w, t, emb = embedding_dim) if (length(t) < emb) NA else rep(unique(w), each = emb)
+
+feat <- dat_i2 %>%
+  arrange(ID, week, TIME) %>%
+  group_by(ID, week) %>%
+  group_modify(~ tibble(
+    leader_velo = gold_velocity(.x$l_res, .x$TIME),
+    follower_velo = gold_velocity(.x$f_res, .x$TIME),
+    event_velo = gold_velocity(.x$e_res, .x$TIME),
+    leader_accel = gold_accel(.x$l_res, .x$TIME),
+    follower_accel = gold_accel(.x$f_res, .x$TIME),
+    id_rep = rep_id(.x$ID, .x$TIME),
+    week_rep = rep_week(.x$week, .x$TIME)
+  )) %>% ungroup() %>% drop_na()
+
+feat <- feat %>% rename(ID_out = id_rep, context = week_rep) %>%
+  mutate(ID_out = factor(ID_out), context = factor(context))
+```
+
+## Summaries and Example Models
+
+```{r}
+feat_summary <- feat %>%
+  group_by(ID_out, context) %>%
+  summarise(
+    leader_freq_param = mean(abs(leader_velo), na.rm = TRUE),
+    event_freq_param  = mean(abs(event_velo), na.rm = TRUE),
+    leader_damp_param = mean(leader_accel, na.rm = TRUE),
+    follower_damp_param = mean(follower_accel, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+mod_velo <- lmer(leader_velo ~ event_velo + follower_velo + (1 | ID_out), data = feat)
+mod_accel <- lmer(leader_accel ~ event_velo + follower_accel + (1 | ID_out), data = feat)
+
+summary(mod_velo)
+summary(mod_accel)
+```
+
+## Save Outputs
+
+```{r}
+out_feat <- here("data", "ds_features.csv")
+out_sum  <- here("data", "ds_features_summary.csv")
+readr::write_csv(feat, out_feat)
+readr::write_csv(feat_summary, out_sum)
+cat("Wrote:", out_feat, "\n")
+cat("Wrote:", out_sum, "\n")
+```
+
+# Sensitivity (Optional)
+
+Sensitivity checks over `embedding_dim` and `impute_option` help assess robustness of derived features.
+
+```{r}
+emb_grid <- c(3, 4, 5)
+imp_grid <- c("linear", "spline")
+
+sens <- list(); k <- 1
+for (emb in emb_grid) {
+  for (imp in imp_grid) {
+    di <- dat %>%
+      group_by(ID, week) %>%
+      group_modify(~ na_interpolation(.x, option = imp)) %>%
+      ungroup() %>% mutate(TIME = sday - 1)
+    a <- di %>% filter(week == 1)
+    b <- di %>% filter(week == 2)
+    c <- di %>% filter(week == 3)
+    r_al <- detres(a, "GrL"); r_bl <- detres(b, "GrL"); r_cl <- detres(c, "GrL")
+    r_ae <- detres(a, "event_agg"); r_be <- detres(b, "event_agg"); r_ce <- detres(c, "event_agg")
+    di2 <- bind_rows(a, b, c) %>% arrange(ID, week, TIME) %>%
+      mutate(l_res = c(r_al, r_bl, r_cl), e_res = c(r_ae, r_be, r_ce))
+    ft <- di2 %>% arrange(ID, week, TIME) %>% group_by(ID, week) %>%
+      group_modify(~ tibble(l_v = gold_velocity(.x$l_res, .x$TIME, emb))) %>%
+      ungroup() %>% drop_na() %>% mutate(embedding = emb, impute = imp)
+    sens[[k]] <- ft; k <- k + 1
+  }
+}
+
+sens_df <- bind_rows(sens)
+sens_df %>% group_by(embedding, impute) %>% summarise(mean_abs_lv = mean(abs(l_v)), .groups = "drop")
+```
+
+# Closing Notes
+
+- Derivatives are in units per day; adapt when using denser sampling (e.g., CRA).
+- Consider state-space smoothing as a complementary preprocessing step.
+- For formal damping/frequency parameters, fit the second-order ODE directly (continuous-time or state-space formulations are suitable alternatives).

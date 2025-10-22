@@ -1,0 +1,183 @@
+---
+title: "Dynamic Identity Simulation + Visuals (Step 1–3)"
+format:
+  html:
+    toc: true
+    toc-depth: 2
+    code-fold: true
+    number-sections: true
+  pdf: default
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+# Purpose
+
+This Quarto file simulates dynamic identity data and walks through Step 1–3 (interpolation, residualization, GOLD derivatives), then creates visual diagnostics/plots.
+
+# Setup
+
+```{r}
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(here)
+  library(nlme)
+  library(imputeTS)
+  library(doremi)
+  library(lmerTest)
+})
+source(here("scripts", "simulate_dynamic_identity.R"))
+
+embedding_dim <- 4
+impute_option <- "linear"
+```
+
+# Simulate Data
+
+```{r}
+sim <- simulate_identity_data(n_id = 20, seed = 42)
+sim <- sim %>% mutate(event_agg = (e2 + e3 + e6)/3)
+head(sim)
+```
+
+## Visual: Raw Time Series (Example IDs)
+
+```{r}
+show_ids <- sample(unique(sim$ID), 6)
+sim_long <- sim %>% filter(ID %in% show_ids) %>%
+  pivot_longer(c(GrL, GrF, event_agg), names_to = "var", values_to = "val")
+
+ggplot(sim_long, aes(sday, val, color = var, group = var)) +
+  geom_line(size = 0.8) +
+  facet_grid(ID ~ week, labeller = label_both) +
+  scale_color_brewer(palette = "Dark2") +
+  labs(title = "Raw time series (selected IDs)", x = "Study day", y = "Value") +
+  theme_minimal()
+```
+
+# Step 1: Interpolation
+
+```{r}
+dat_i <- sim %>%
+  group_by(ID, week) %>%
+  group_modify(~ na_interpolation(.x, option = impute_option)) %>%
+  ungroup() %>% mutate(TIME = sday - 1)
+```
+
+# Step 2: Residualization
+
+```{r}
+detres <- function(df, y) {
+  m <- lme(as.formula(paste0(y, " ~ TIME")), random = ~ TIME | ID, data = df,
+           control = list(opt = "optim"), na.action = na.omit)
+  residuals(m, type = "response")
+}
+
+ctx_a <- dat_i %>% filter(week == 1)
+ctx_b <- dat_i %>% filter(week == 2)
+ctx_c <- dat_i %>% filter(week == 3)
+
+res_a_l <- detres(ctx_a, "GrL"); res_b_l <- detres(ctx_b, "GrL"); res_c_l <- detres(ctx_c, "GrL")
+res_a_f <- detres(ctx_a, "GrF"); res_b_f <- detres(ctx_b, "GrF"); res_c_f <- detres(ctx_c, "GrF")
+res_a_e <- detres(ctx_a, "event_agg"); res_b_e <- detres(ctx_b, "event_agg"); res_c_e <- detres(ctx_c, "event_agg")
+
+di2 <- bind_rows(ctx_a, ctx_b, ctx_c) %>%
+  arrange(ID, week, TIME) %>%
+  mutate(l_res = c(res_a_l, res_b_l, res_c_l),
+         f_res = c(res_a_f, res_b_f, res_c_f),
+         e_res = c(res_a_e, res_b_e, res_c_e))
+```
+
+## Visual: Residual Series (One ID)
+
+```{r}
+one_id <- sample(unique(di2$ID), 1)
+ggplot(di2 %>% filter(ID == one_id), aes(TIME, l_res)) +
+  geom_hline(yintercept = 0, linetype = 3) +
+  geom_line() + facet_wrap(~ week, nrow = 1) +
+  labs(title = paste("Leader residuals for ID", one_id), x = "Time (days)", y = "l_res") +
+  theme_minimal()
+```
+
+# Step 3: Derivatives (GOLD)
+
+```{r}
+gold_velocity <- function(x, t, emb = embedding_dim) {
+  if (length(t) < emb) return(NA_real_)
+  g <- calculate.gold(x, t, embedding = emb)
+  as.numeric(g$dsignal[seq_len(emb), 2])
+}
+gold_accel <- function(x, t, emb = embedding_dim) {
+  if (length(t) < emb) return(NA_real_)
+  g <- calculate.gold(x, t, embedding = emb)
+  as.numeric(g$dsignal[seq_len(emb), 3])
+}
+rep_id <- function(id, t, emb = embedding_dim) if (length(t) < emb) NA else rep(unique(id), each = emb)
+rep_week <- function(w, t, emb = embedding_dim) if (length(t) < emb) NA else rep(unique(w), each = emb)
+
+feat <- di2 %>%
+  arrange(ID, week, TIME) %>%
+  group_by(ID, week) %>%
+  group_modify(~ tibble(
+    leader_velo = gold_velocity(.x$l_res, .x$TIME),
+    event_velo = gold_velocity(.x$e_res, .x$TIME),
+    leader_accel = gold_accel(.x$l_res, .x$TIME),
+    follower_accel = gold_accel(.x$f_res, .x$TIME),
+    id_rep = rep_id(.x$ID, .x$TIME),
+    week_rep = rep_week(.x$week, .x$TIME)
+  )) %>% ungroup() %>% drop_na()
+
+feat <- feat %>% rename(ID_out = id_rep, context = week_rep)
+```
+
+## Visual: Phase Portrait (Residual vs Velocity)
+
+```{r}
+feat_phase <- di2 %>% arrange(ID, week, TIME) %>% group_by(ID, week) %>%
+  group_modify(~ tibble(
+    TIME = .x$TIME[seq_len(embedding_dim)],
+    l_res = .x$l_res[seq_len(embedding_dim)],
+    leader_velo = gold_velocity(.x$l_res, .x$TIME)
+  )) %>% ungroup() %>% drop_na()
+
+pp_id <- sample(unique(feat$ID_out), 1)
+ggplot(feat_phase %>% filter(ID == pp_id), aes(l_res, leader_velo, color = TIME)) +
+  geom_path(arrow = arrow(type = "closed", length = unit(2, "pt"))) +
+  facet_wrap(~ week, nrow = 1) +
+  scale_color_viridis_c() +
+  labs(title = paste("Phase portrait (ID", pp_id, ")"), x = "Leader residual (l_res)", y = "Velocity (dl/dt)") +
+  theme_minimal()
+```
+
+## Visual: Distributions of Velocity and Acceleration
+
+```{r}
+ggplot(feat, aes(leader_velo, fill = context)) +
+  geom_density(alpha = 0.4) +
+  labs(title = "Distribution of leader velocity by context") + theme_minimal()
+
+ggplot(feat, aes(leader_accel, fill = context)) +
+  geom_density(alpha = 0.4) +
+  labs(title = "Distribution of leader acceleration by context") + theme_minimal()
+```
+
+## Visual: Event vs Leader Velocity (Scatter)
+
+```{r}
+ggplot(feat, aes(event_velo, leader_velo, color = context)) +
+  geom_point(alpha = 0.6) + geom_smooth(method = "lm", se = FALSE) +
+  labs(title = "Event velocity predicts leader velocity", x = "Event velocity", y = "Leader velocity") +
+  theme_minimal()
+```
+
+# Example Multilevel Models
+
+```{r}
+mod_velo <- lmer(leader_velo ~ event_velo + (1 | ID_out), data = feat)
+mod_accel <- lmer(leader_accel ~ event_velo + (1 | ID_out), data = feat)
+summary(mod_velo)
+summary(mod_accel)
+```
+
